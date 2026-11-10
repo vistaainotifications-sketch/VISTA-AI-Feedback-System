@@ -25,6 +25,27 @@ const pool = process.env.DATABASE_URL
 
 // MIDDLEWARE
 app.use(helmet({ contentSecurityPolicy: false }));
+
+// Allow the VISTA AI main portal to read public review analytics.
+// Keep the allow-list restricted to known frontend origins.
+const allowedOrigins = new Set([
+    "https://vista-ai-frontend.onrender.com",
+    "http://localhost:5173",
+    process.env.FRONTEND_URL
+].filter(Boolean));
+
+app.use((req, res, next) => {
+    const origin = req.headers.origin;
+    if (origin && allowedOrigins.has(origin)) {
+        res.setHeader("Access-Control-Allow-Origin", origin);
+        res.setHeader("Vary", "Origin");
+        res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+        res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+    }
+    if (req.method === "OPTIONS") return res.sendStatus(204);
+    next();
+});
+
 app.use(express.json({ limit: "30kb" }));
 app.use(express.static(path.join(dir, "public")));
 
@@ -371,6 +392,64 @@ app.delete("/api/admin/feedback/:id", admin, async (req, res) => {
         return res.status(500).json({
             error: "Unable to delete feedback."
         });
+    }
+});
+
+// PUBLIC AGGREGATED INSIGHTS (approved reviews with publication consent only)
+app.get("/api/public/insights", async (req, res) => {
+    try {
+        if (!pool) {
+            return res.status(503).json({ error: "Database is not configured." });
+        }
+
+        const result = await pool.query(`
+            WITH public_feedback AS (
+                SELECT overall_rating, service_rating, website_rating,
+                       innovation_rating, professionalism_rating,
+                       support_rating, recommend
+                FROM vista_feedback
+                WHERE status = 'APPROVED'
+                  AND publish_consent = TRUE
+            ),
+            totals AS (
+                SELECT
+                    COUNT(*)::int AS total_reviews,
+                    COALESCE(ROUND(AVG(overall_rating)::numeric, 2), 0) AS average_rating,
+                    COALESCE(ROUND(AVG(service_rating)::numeric, 2), 0) AS service_rating,
+                    COALESCE(ROUND(AVG(website_rating)::numeric, 2), 0) AS website_rating,
+                    COALESCE(ROUND(AVG(innovation_rating)::numeric, 2), 0) AS innovation_rating,
+                    COALESCE(ROUND(AVG(professionalism_rating)::numeric, 2), 0) AS professionalism_rating,
+                    COALESCE(ROUND(AVG(support_rating)::numeric, 2), 0) AS support_rating,
+                    COUNT(*) FILTER (WHERE recommend = TRUE)::int AS recommend_yes,
+                    COUNT(*) FILTER (WHERE recommend = FALSE)::int AS recommend_no
+                FROM public_feedback
+            ),
+            distribution AS (
+                SELECT json_object_agg(stars, rating_count ORDER BY stars) AS rating_distribution
+                FROM (
+                    SELECT gs.stars, COUNT(p.overall_rating)::int AS rating_count
+                    FROM generate_series(1, 5) AS gs(stars)
+                    LEFT JOIN public_feedback p ON p.overall_rating = gs.stars
+                    GROUP BY gs.stars
+                    ORDER BY gs.stars
+                ) d
+            )
+            SELECT totals.*,
+                   COALESCE(distribution.rating_distribution, '{"1":0,"2":0,"3":0,"4":0,"5":0}'::json) AS rating_distribution,
+                   CASE WHEN totals.total_reviews = 0 THEN 0
+                        ELSE ROUND(100.0 * totals.recommend_yes / totals.total_reviews, 1)
+                   END AS recommendation_percentage
+            FROM totals CROSS JOIN distribution
+        `);
+
+        res.setHeader("Cache-Control", "no-store");
+        return res.json({
+            ...result.rows[0],
+            updated_at: new Date().toISOString()
+        });
+    } catch (error) {
+        console.error("Public insights error:", error);
+        return res.status(500).json({ error: "Unable to load review insights." });
     }
 });
 
